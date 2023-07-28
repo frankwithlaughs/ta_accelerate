@@ -1,0 +1,942 @@
+
+import pandas as pd
+import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
+import warnings
+
+warnings.filterwarnings('ignore', message='Mean of empty slice')
+warnings.filterwarnings('ignore', 'All-NaN slice encountered')
+warnings.filterwarnings('ignore', 'invalid value encountered in divide')
+
+
+class TechnicalAnalysisFeatures:
+    def __init__(self, interpolate_nan):
+        self.interpolate_nan = interpolate_nan
+
+    def add_all_ta_features(self, arr3d):
+        # ['v', 'vw', 'o', 'c', 'h', 'l', 'n']
+        #   0    1     2    3    4    5    6
+
+        self._open = arr3d[:, :, 2]
+        self._high = arr3d[:, :, 4]
+        self._low = arr3d[:, :, 5]
+        self._close = arr3d[:, :, 3]
+        self._volume = arr3d[:, :, 0]
+
+        self.num_tickers = arr3d.shape[0]
+        self.window_max = arr3d.shape[1]
+
+        self.calculate_base_columns()
+
+        np_volume = self.add_volume_ta()
+        np_volatility = self.add_volatility_ta()
+        np_trend = self.add_trend_ta()
+        np_momentum = self.add_momentum_ta()
+        np_others = self.add_others_ta()
+
+        result = np.concatenate([np_volume, np_volatility, np_trend, np_momentum, np_others], axis=2)
+
+        return result
+
+    def calculate_base_columns(self):
+
+        self.empty_arr = np.empty((self.num_tickers, self.window_max))
+        self.empty_arr[:] = np.nan
+        self.np_ones = np.ones(self.window_max)
+
+        self.diff_h_l = self._high - self._low
+
+        self.clhc = ((self._close - self._low) - (self._high - self._close)) / (self.diff_h_l + 1e-10)
+        self.clhc = np.nan_to_num(self.clhc)  # float division by zero
+
+        self.clhc_v = self.clhc * self._volume
+
+        self.shifted_h_diff = self.np_shift_diff_fast(self._high)
+
+        self.shifted_l_diff = self.np_shift_diff_fast(self._low)
+
+        self.shifted_c_diff = self.np_shift_diff_fast(self._close)
+
+        self.mean_c = np.mean(self._close)
+
+        self.shift_c_fillna = self.empty_arr.copy()
+        self.shift_c_fillna[:, 1:] = self._close[:, :-1]
+
+        self.shift_c_fill_mean = self.shift_c_fillna.copy()
+        self.shift_c_fill_mean[:, 0] = self.mean_c
+
+        self.shift_h_fillna = self.empty_arr.copy()
+        self.shift_h_fillna[:, 1:] = self._high[:, :-1]
+
+        self.shift_l_fillna = self.empty_arr.copy()
+        self.shift_l_fillna[:, 1:] = self._low[:, :-1]
+
+        self.typical_price = (self._high + self._low + self._close) / 3.0
+
+        tr2 = np.abs(self._high - self.shift_c_fillna)
+        tr3 = np.abs(self._low - self.shift_c_fillna)
+        self.true_range = np.maximum(self.diff_h_l, np.maximum(tr2, tr3))
+        self.true_range[:, 0] = self.diff_h_l[:, 0]
+
+        window_fast_default = 12
+        window_fast = self.resized_window(window_fast_default)
+        window_slow_default = 26
+        window_slow = self.resized_window(window_slow_default)
+        self.emafast = self.np_ema(self._close, window_fast)  # 12
+        self.emaslow = self.np_ema(self._close, window_slow)  # 26
+
+        window = 14
+        window = self.resized_window(window)
+        self.lowest_low_14 = self.np_rolling_min(self._low, window)
+        self.highest_high_14 = self.np_rolling_max(self._high, window)
+        self.delta_hhigh_llow_14 = self.highest_high_14 - self.lowest_low_14
+
+        return
+
+    def resized_window(self, window_default):
+        return self.window_max if (self.window_max < window_default) else window_default
+
+    def np_ema(self, numpy_array, periods, alpha=None):
+        if alpha is None:
+            alpha = 2 / (periods + 1)
+        result = self.empty_arr.copy()
+        try:
+            first_non_nan = np.where(~np.isnan(numpy_array))[1][0]
+        except:
+            return result
+        result[:, first_non_nan] = numpy_array[:, first_non_nan]
+        for i in range(first_non_nan + 1, numpy_array.shape[1]):
+            result[:, i] = alpha * numpy_array[:, i] + (1 - alpha) * result[:, i - 1]
+        if not self.interpolate_nan:
+            result[:, :periods - 1 + first_non_nan] = np.nan
+        return result
+
+    def np_rolling_mean(self, numpy_array, window, min_periods=None, fill_missing=None):
+        if min_periods is None:
+            min_periods = 1 if self.interpolate_nan else window
+        rolling_mean_np = self.empty_arr.copy()
+        if fill_missing:
+            rolling_mean_np[:, :min_periods - 1] = fill_missing
+
+        rolling_mean_np[:, min_periods - 1:window - 1] = np.array([
+            np.nanmean(numpy_array[:, max(0, i - window + 1):i + 1], axis=1) for i in
+            range(min_periods - 1, window - 1)
+        ]).T
+
+        rolling_window = self.rolling_window(numpy_array, window)
+        rolling_mean_np[:, window - 1:] = np.nanmean(rolling_window, axis=-1)
+        return rolling_mean_np
+
+    def np_rolling_sum(self, numpy_array, window):
+        min_periods = 1 if self.interpolate_nan else window
+        rolling_sum_np = self.empty_arr.copy()
+        rolling_sum_np[:, min_periods - 1:window - 1] = [np.sum(numpy_array[:, max(0, i - window + 1):i + 1], axis=1)
+                                                         for i in range(min_periods - 1, window - 1)]
+        rolling_sum_np[:, window - 1:] = np.apply_along_axis(
+            lambda m: np.convolve(m, self.np_ones[:window], mode='valid'), axis=1, arr=numpy_array)
+        return rolling_sum_np
+
+    def np_rolling_std(self, numpy_array, window):
+        min_periods = 1 if self.interpolate_nan else window
+        rolling_std_np = self.empty_arr.copy()
+        rolling_std_np[:, min_periods - 1:window - 1] = [
+            np.std(numpy_array[:, max(0, i - window + 1):i + 1], axis=1, ddof=0) for i in
+            range(min_periods - 1, window - 1)]
+
+        rolling_std_np[:, window - 1:] = np.sqrt(
+            np.apply_along_axis(lambda m: np.convolve(m ** 2, np.ones(window), mode='valid'), axis=1,
+                                arr=numpy_array) / window
+            - np.apply_along_axis(lambda m: np.convolve(m, np.ones(window), mode='valid'), axis=1,
+                                  arr=numpy_array) ** 2 / window ** 2)
+
+
+        return rolling_std_np
+
+    def np_rolling_max(self, numpy_array, window):
+        min_periods = 1 if self.interpolate_nan else window
+        result = self.empty_arr.copy()
+        result[:, window - 1:] = np.max(self.rolling_window(numpy_array, window), axis=-1)
+        for i in range(min_periods, window):
+            valid = ~np.isnan(numpy_array[:, :i])
+            if valid.sum(axis=0).min() >= min_periods:
+                result[:, i - 1] = np.max(numpy_array[:, :i][valid], axis=1)
+        return result
+
+    def np_rolling_max_minper1(self, numpy_array, window):
+
+        min_periods = 1
+        result = self.empty_arr.copy()
+        a = self.rolling_window(numpy_array, window)
+        result[:, window - 1:] = np.nanmax(a, axis=-1)
+
+        for i in range(min_periods, window):
+            result[:, i - 1] = np.nanmax(numpy_array[:, :i], axis=1)
+
+        return result
+
+    def np_rolling_min(self, numpy_array, window):
+        min_periods = 1 if self.interpolate_nan else window
+        result = self.empty_arr.copy()
+        result[:, window - 1:] = np.min(self.rolling_window(numpy_array, window), axis=-1)
+        for i in range(min_periods, window):
+            valid = ~np.isnan(numpy_array[:, :i])
+            if valid.sum(axis=0).min() >= min_periods:
+                result[:, i - 1] = np.min(numpy_array[:, :i][valid], axis=1)
+        return result
+
+    def np_rolling_min_minper1(self, numpy_array, window):
+
+        min_periods = 1
+        result = self.empty_arr.copy()
+        result[:, window - 1:] = np.nanmin(self.rolling_window(numpy_array, window), axis=-1)
+        for i in range(min_periods, window):
+            result[:, i - 1] = np.nanmin(numpy_array[:, :i], axis=1)
+        return result
+
+    def rolling_window(self, numpy_array, window):
+        min_periods = 1 if self.interpolate_nan else window
+        shape = numpy_array.shape[:-1] + (numpy_array.shape[-1] - min_periods + 1, window)
+        strides = numpy_array.strides + (numpy_array.strides[-1],)
+        rolled = np.lib.stride_tricks.as_strided(numpy_array, shape=shape, strides=strides)
+        return rolled
+
+    def np_shift_diff_fast(self, numpy_array, fill_missing=np.nan):
+        shifted_numpy_array = self.empty_arr.copy()
+        if isinstance(fill_missing, np.ndarray) and fill_missing.ndim == 1:
+            fill_missing = fill_missing[:, np.newaxis]
+        shifted_numpy_array[:, 0:1] = fill_missing
+        shifted_numpy_array[:, 1:] = numpy_array[:, 1:] - numpy_array[:, :-1]
+        return shifted_numpy_array
+
+    def np_shift_fast(self, numpy_array, fill_missing=np.nan):
+        shifted_numpy_array = self.empty_arr.copy()
+        if isinstance(fill_missing, np.ndarray) and fill_missing.ndim == 1:
+            fill_missing = fill_missing[:, np.newaxis]
+        shifted_numpy_array[:, 0:1] = fill_missing
+        shifted_numpy_array[:, 1:] = numpy_array[:, :-1]
+        return shifted_numpy_array
+
+    def np_shift_fast_window(self, numpy_array, window, fill_missing=np.nan):
+        shifted_numpy_array = self.empty_arr.copy()
+        if isinstance(fill_missing, np.ndarray) and fill_missing.ndim == 1:
+            fill_missing = fill_missing[:, np.newaxis]
+        shifted_numpy_array[:, 0:window] = fill_missing
+        shifted_numpy_array[:, window:] = numpy_array[:, :-window]
+        return shifted_numpy_array
+
+    def add_volume_ta(self):
+
+        result = np.empty((self.num_tickers, self.window_max, 10))
+
+        volume_adi = self.clhc_v.cumsum(axis=1)
+        result[:, :, 0] = volume_adi
+
+        obv = np.where(self.shifted_c_diff < 0, -self._volume, self._volume)
+        volume_obv = obv.cumsum(axis=1)
+        result[:, :, 1] = volume_obv
+
+        # Chaikin Money Flow
+        window_default = 20
+        window = self.resized_window(window_default)
+
+        volume_cmf = self.np_rolling_sum(self.clhc_v, window) / self.np_rolling_sum(self._volume, window)
+        result[:, :, 2] = volume_cmf
+
+        # Force Index
+        window_default = 13
+        window = self.resized_window(window_default)
+        fi_series = self.shifted_c_diff * self._volume
+        volume_fi = self.np_ema(fi_series, window)  # 13
+        result[:, :, 3] = volume_fi
+
+        # Ease of Movement
+        window_default = 14
+        window = self.resized_window(window_default)
+        emv = ((self.shifted_h_diff + self.shifted_l_diff) * (self.diff_h_l) / (2 * self._volume))
+        volume_em = emv * 100000000
+        result[:, :, 4] = volume_em
+        volume_sma_em = self.np_rolling_mean(volume_em, window)
+        result[:, :, 5] = volume_sma_em
+
+        # Volume Price Trend
+        if self.window_max > 1:
+            vpt_np = self._volume * (self._close - self.shift_c_fill_mean) / self.shift_c_fill_mean
+            vpt_np_mean = np.nanmean(vpt_np, axis=1)
+            volume_vpt_np = self.np_shift_fast(vpt_np, vpt_np_mean) + vpt_np
+        else:
+            volume_vpt_np = 0
+        result[:, :, 6] = volume_vpt_np
+
+        # Volume Weighted Average Price
+        window_default = 14
+        window = self.resized_window(window_default)
+        typical_price_volume = self.typical_price * self._volume
+        total_pv = self.np_rolling_sum(typical_price_volume, window)
+        total_volume = self.np_rolling_sum(self._volume, window)
+        volume_vwap = total_pv / total_volume
+        result[:, :, 7] = volume_vwap
+
+        # Money Flow Indicator
+        window_default = 14
+        window = self.resized_window(window_default)
+        min_periods = 1 if self.interpolate_nan else window
+        shifted_typical_price = self.np_shift_fast(self.typical_price)
+        up_down = np.where(self.typical_price > shifted_typical_price, 1,
+                           np.where(self.typical_price < shifted_typical_price, -1, 0))
+        up_down[:, 0] = 0
+        mfr = self.typical_price * self._volume * up_down
+        n_positive_mf = np.zeros_like(mfr)
+        n_negative_mf = np.zeros_like(mfr)
+        for i in range(min_periods - 1, window - 1):
+            n_positive_mf[:, i] = np.sum(np.where(mfr[:, :i + 1] >= 0.0, mfr[:, :i + 1], 0.0), axis=1)
+            n_negative_mf[:, i] = abs(np.sum(np.where(mfr[:, :i + 1] < 0.0, mfr[:, :i + 1], 0.0), axis=1))
+        n_positive_mf[:, window - 1:] = np.apply_along_axis(
+            lambda m: np.convolve(np.where(m >= 0.0, m, 0.0), np.ones(window), 'valid'), axis=1, arr=mfr)
+        n_negative_mf[:, window - 1:] = abs(
+            np.apply_along_axis(lambda m: np.convolve(np.where(m < 0.0, m, 0.0), np.ones(window), 'valid'), axis=1,
+                                arr=mfr))
+        volume_mfi = n_positive_mf / (n_negative_mf + 1e-10)
+        volume_mfi[:, :min_periods - 1] = np.nan
+        volume_mfi = 100 - (100 / (1 + volume_mfi))
+        result[:, :, 8] = volume_mfi
+
+
+        price_change = np.diff(self._close) / self._close[:, :-1]
+        vol_decrease = self._volume[:, 1:] < self._volume[:, :-1]
+        volume_nvi = np.full_like(self._close, np.nan)
+        volume_nvi[:, 0] = 1000
+        for i in range(1, volume_nvi.shape[1]):
+            volume_nvi[:, i] = np.where(vol_decrease[:, i - 1], volume_nvi[:, i - 1] * (1.0 + price_change[:, i - 1]),
+                                        volume_nvi[:, i - 1])
+
+        result[:, :, 9] = volume_nvi
+
+        return result
+
+    def add_volatility_ta(self):
+
+        result = np.empty((self.num_tickers, self.window_max, 21))
+
+        # Bollinger Bands
+
+        window_default = 20
+        window = self.resized_window(window_default)
+        window_dev = 2
+
+        mavg = self.np_rolling_mean(self._close, window)
+        mstd = self.np_rolling_std(self._close, window)
+        window_by_mstd = window_dev * mstd
+        hband = mavg + window_by_mstd
+        lband = mavg - window_by_mstd
+
+        volatility_bbm = mavg
+        volatility_bbh = hband
+        volatility_bbl = lband
+        volatility_bbw = ((hband - lband) / mavg) * 100
+        volatility_bbp = (self._close - lband) / np.where(hband != lband, hband - lband, np.nan)
+        volatility_bbhi = np.where(self._close > hband, 1.0, 0.0)
+        volatility_bbli = np.where(self._close < lband, 1.0, 0.0)
+        result[:, :, 0] = volatility_bbm
+        result[:, :, 1] = volatility_bbh
+        result[:, :, 2] = volatility_bbl
+        result[:, :, 3] = volatility_bbw
+        result[:, :, 4] = volatility_bbp
+        result[:, :, 5] = volatility_bbhi
+        result[:, :, 6] = volatility_bbli
+
+        # Keltner Channel
+        window_default = 10
+        window = self.resized_window(window_default)
+        tp = self.np_rolling_mean(self.typical_price, window)  # 10
+        tp_high = (4 * self._high - 2 * self._low + self._close) / 3
+        tp_high = self.np_rolling_mean(tp_high, window, min_periods=1)
+        tp_low = (-2 * self._high + 4 * self._low + self._close) / 3
+        tp_low = self.np_rolling_mean(tp_low, window, min_periods=1)
+
+        volatility_kcc = tp
+        volatility_kch = tp_high
+        volatility_kcl = tp_low
+        volatility_kcw = np.nan_to_num(((tp_high - tp_low) / tp) * 100, nan=0)
+        volatility_kcp = np.where(tp_high != tp_low, (self._close - tp_low) / (tp_high - tp_low + 1e-10), np.nan)
+
+        volatility_kchi = np.where(self._close > tp_high, 1.0, 0.0)
+        volatility_kcli = np.where(self._close < tp_low, 1.0, 0.0)
+        result[:, :, 7] = volatility_kcc
+        result[:, :, 8] = volatility_kch
+        result[:, :, 9] = volatility_kcl
+        result[:, :, 10] = volatility_kcw
+        result[:, :, 11] = volatility_kcp
+        result[:, :, 12] = volatility_kchi
+        result[:, :, 13] = volatility_kcli
+
+        # # Donchian Channel
+        window_default = 20
+        window = self.resized_window(window_default)
+        dc_hband = self.np_rolling_max(self._high, window)
+        dc_lband = self.np_rolling_min(self._low, window)
+        dc_delta_hl = dc_hband - dc_lband
+
+        volatility_dcl = dc_lband
+        volatility_dch = dc_hband
+        volatility_dcm = (dc_delta_hl / 2.0) + dc_lband
+        mavg = self.np_rolling_mean(self._close, window)
+        volatility_dcw = (dc_delta_hl / mavg) * 100
+        volatility_dcp = (self._close - dc_lband) / (dc_delta_hl + 1e-10)
+        result[:, :, 14] = volatility_dcl
+        result[:, :, 15] = volatility_dch
+        result[:, :, 16] = volatility_dcm
+        result[:, :, 17] = volatility_dcw
+        result[:, :, 18] = volatility_dcp
+
+        # # Average True Range
+        window_default = 10
+        try:
+            window = self.resized_window(window_default)
+            atr = np.zeros((self.num_tickers, self.window_max))
+            atr[:, window - 1] = np.mean(self.true_range[:, :window], axis=1)
+            for i in range(window, self.window_max):
+                atr[:, i] = (atr[:, i - 1] * (window - 1) + self.true_range[:, i]) / float(window)
+            volatility_atr = atr
+        except:
+            volatility_atr = self.empty_arr.copy()
+        result[:, :, 19] = volatility_atr
+
+        # # Ulcer Index
+        # window_default = 14
+        window_default = 14
+        window = self.resized_window(window_default)
+        ui_max = self.np_rolling_max_minper1(self._close, window)
+        r_i = 100 * (self._close - ui_max) / ui_max
+        volatility_ui = np.sqrt(self.np_rolling_mean(r_i ** 2, window))
+        result[:, :, 20] = volatility_ui
+
+        return result
+
+    def add_trend_ta(self):
+
+        result = np.empty((self.num_tickers, self.window_max, 34))
+
+        # # MACD
+        window_sign_default = 9
+        window_sign = self.resized_window(window_sign_default)
+        macd = self.emafast - self.emaslow
+        macd_signal = self.np_ema(macd, window_sign)
+        macd_diff = macd - macd_signal
+        if self.window_max > 1:
+            trend_macd = macd
+            trend_macd_signal = macd_signal
+            trend_macd_diff = macd_diff
+        else:
+            trend_macd = np.full((self.num_tickers, 1), np.nan)
+            trend_macd_signal = np.full((self.num_tickers, 1), np.nan)
+            trend_macd_diff = np.full((self.num_tickers, 1), np.nan)
+        result[:, :, 0] = trend_macd
+        result[:, :, 1] = trend_macd_signal
+        result[:, :, 2] = trend_macd_diff
+
+        # # SMAs
+        window_fast_default = 12
+        window_fast = self.resized_window(window_fast_default)
+        window_slow_default = 26
+        window_slow = self.resized_window(window_slow_default)
+        trend_sma_fast = self.np_rolling_mean(self._close, window_fast)  # 12
+        trend_sma_slow = self.np_rolling_mean(self._close, window_slow)  # 26
+        result[:, :, 3] = trend_sma_fast
+        result[:, :, 4] = trend_sma_slow
+
+        # EMAs
+        result[:, :, 5] = self.emafast
+        result[:, :, 6] = self.emaslow
+
+        # Vortex Indicator
+        window_default = 14
+        window = self.resized_window(window_default)
+        trng_sum = self.np_rolling_sum(self.true_range, window)
+        vmp = np.abs(self._high - self.shift_l_fillna)
+        vmm = np.abs(self._low - self.shift_h_fillna)
+        trend_vortex_ind_pos = self.np_rolling_sum(vmp, window) / trng_sum
+        trend_vortex_ind_neg = self.np_rolling_sum(vmm, window) / trng_sum
+        trend_vortex_ind_diff = trend_vortex_ind_pos - trend_vortex_ind_neg
+        result[:, :, 7] = trend_vortex_ind_pos
+        result[:, :, 8] = trend_vortex_ind_neg
+        result[:, :, 9] = trend_vortex_ind_diff
+
+        # TRIX Indicator
+        window_default = 15
+        window = self.resized_window(window_default)
+        if self.window_max > 1:
+            ema1 = self.np_ema(self._close, window)
+            ema2 = self.np_ema(ema1, window)
+            ema3 = self.np_ema(ema2, window)
+            shifted_ema3 = self.np_shift_fast(ema3, fill_missing=np.nanmean(ema3, axis=1))
+            trend_trix = (ema3 - shifted_ema3) / shifted_ema3
+            trend_trix *= 100
+        else:
+            # trend_trix = np.full((self.num_tickers, 1), np.nan)
+            trend_trix = self.empty_arr.copy()
+        result[:, :, 10] = trend_trix
+
+        # # Mass Index
+        if self.window_max > 1:
+            window_fast_default = 9
+            window_fast = self.resized_window(window_fast_default)
+            window_slow_default = 25
+            window_slow = self.resized_window(window_slow_default)
+            ema1 = self.np_ema(self.diff_h_l, window_fast)
+            ema2 = self.np_ema(ema1, window_fast)
+            mass = ema1 / ema2
+            trend_mass_index = self.np_rolling_sum(mass, window_slow)
+        else:
+            trend_mass_index = np.full((self.num_tickers, 1), np.nan)
+        result[:, :, 11] = trend_mass_index
+
+        # # DPO Indicator
+        window_default = 20
+        window = self.resized_window(window_default)
+        dpo_pt1 = self.np_shift_fast_window(self._close, int(0.5 * window) + 1, fill_missing=self.mean_c)
+        dpo_pt2 = self.np_rolling_mean(self._close, window)
+        trend_dpo = dpo_pt1 - dpo_pt2
+        result[:, :, 12] = trend_dpo
+
+        # KST Indicator
+        roc1_default = 10
+        roc1 = self.resized_window(roc1_default)
+        roc2_default = 15
+        roc2 = self.resized_window(roc2_default)
+        roc3_default = 20
+        roc3 = self.resized_window(roc3_default)
+        roc4_default = 30
+        roc4 = self.resized_window(roc4_default)
+        window_1_default = 10
+        window_1 = self.resized_window(window_1_default)
+        window_2_default = 10
+        window_2 = self.resized_window(window_2_default)
+        window_3_default = 10
+        window_3 = self.resized_window(window_3_default)
+        window_4_default = 15
+        window_4 = self.resized_window(window_4_default)
+        nsig_default = 9
+        nsig = self.resized_window(nsig_default)
+        rocma1_shift = self.np_shift_fast_window(self._close, roc1, fill_missing=np.nanmean(self._close, axis=1))
+        rocma1_base = (self._close - rocma1_shift) / rocma1_shift
+        rocma1 = self.np_rolling_mean(rocma1_base, window_1)
+        rocma2_shift = self.np_shift_fast_window(self._close, roc2, fill_missing=np.nanmean(self._close, axis=1))
+        rocma2_base = (self._close - rocma2_shift) / rocma2_shift
+        rocma2 = self.np_rolling_mean(rocma2_base, window_2)
+        rocma3_shift = self.np_shift_fast_window(self._close, roc3, fill_missing=np.nanmean(self._close, axis=1))
+        rocma3_base = (self._close - rocma3_shift) / rocma3_shift
+        rocma3 = self.np_rolling_mean(rocma3_base, window_3)
+        rocma4_shift = self.np_shift_fast_window(self._close, roc4, fill_missing=np.nanmean(self._close, axis=1))
+        rocma4_base = (self._close - rocma4_shift) / rocma4_shift
+        rocma4 = self.np_rolling_mean(rocma4_base, window_4)
+        trend_kst = 100 * (rocma1 + 2 * rocma2 + 3 * rocma3 + 4 * rocma4)
+        trend_kst_sig = self.np_rolling_mean(trend_kst, nsig, min_periods=1)
+        trend_kst_diff = trend_kst - trend_kst_sig
+        result[:, :, 13] = trend_kst
+        result[:, :, 14] = trend_kst_sig
+        result[:, :, 15] = trend_kst_diff
+
+        # # Ichimoku Indicator
+        window_1_default = 9
+        window_1 = self.resized_window(window_1_default)
+        window_2_default = 26
+        window_2 = self.resized_window(window_2_default)
+        window_3_default = 52
+        window_3 = self.resized_window(window_3_default)
+        trend_ichimoku_conv = 0.5 * (
+                    self.np_rolling_max(self._high, window_1) + self.np_rolling_min(self._low, window_1))
+        trend_ichimoku_base = 0.5 * (
+                    self.np_rolling_max(self._high, window_2) + self.np_rolling_min(self._low, window_2))
+        trend_ichimoku_a = 0.5 * (trend_ichimoku_conv + trend_ichimoku_base)
+        trend_ichimoku_b = 0.5 * (
+                    self.np_rolling_max_minper1(self._high, window_3) + self.np_rolling_min_minper1(self._low,
+                                                                                                    window_3))
+        result[:, :, 16] = trend_ichimoku_conv
+        result[:, :, 17] = trend_ichimoku_base
+        result[:, :, 18] = trend_ichimoku_a
+        result[:, :, 19] = trend_ichimoku_b
+
+        # Schaff Trend Cycle (STC)
+        window_fast_default = 23
+        window_fast = self.resized_window(window_fast_default)
+        window_slow_default = 50
+        window_slow = self.resized_window(window_slow_default)
+        cycle_default = 10
+        cycle = self.resized_window(cycle_default)
+        smooth1 = 3
+        smooth2 = 3
+        _emafast = self.np_ema(self._close, window_fast)  # 23
+        _emaslow = self.np_ema(self._close, window_slow)  # 50
+        _macd = _emafast - _emaslow
+        _macdmin = self.np_rolling_min(_macd, cycle)
+        _macdmax = self.np_rolling_max(_macd, cycle)
+        _stoch_k = 100 * (_macd - _macdmin) / (_macdmax - _macdmin + 1e-10)
+        _stoch_d = self.np_ema(_stoch_k, smooth1)
+        _stoch_d_min = self.np_rolling_min(_stoch_d, cycle)
+        _stoch_d_max = self.np_rolling_max(_stoch_d, cycle)
+        _stoch_kd = 100 * (_stoch_d - _stoch_d_min) / (_stoch_d_max - _stoch_d_min + 1e-10)
+        trend_stc = self.np_ema(_stoch_kd, smooth2)
+        result[:, :, 20] = trend_stc
+
+        # Average Directional Movement Index (ADX)
+        window_default = 14
+        window = self.resized_window(window_default)
+        if self.window_max > window_default * 2 - 1:
+            pdm = np.maximum(self._high, self.shift_c_fillna)
+            pdn = np.minimum(self._low, self.shift_c_fillna)
+            diff_directional_movement = pdm - pdn
+
+            trs_initial = np.zeros((self.num_tickers, window - 1))
+            trs = np.zeros((self.num_tickers, self.window_max - (window - 1)))
+            trs[:, 0] = np.sum(diff_directional_movement[:, 1: window + 1], axis=1)
+            for i in range(1, trs.shape[1] - 1):
+                trs[:, i] = trs[:, i - 1] - (trs[:, i - 1] / float(window)) + diff_directional_movement[:, window + i]
+
+            diff_up = self.shifted_h_diff
+            diff_down = - self.shifted_l_diff
+            pos = np.abs(np.where((diff_up > diff_down) & (diff_up > 0), diff_up, 0))
+            neg = np.abs(np.where((diff_down > diff_up) & (diff_down > 0), diff_down, 0))
+
+            dip = np.zeros((self.num_tickers, self.window_max - (window - 1)))
+            dip[:, 0] = np.nansum(pos[:, 1: window + 1], axis=1)
+            for i in range(1, dip.shape[1] - 1):
+                dip[:, i] = dip[:, i - 1] - (dip[:, i - 1] / float(window)) + pos[:, window + i]
+
+            din = np.zeros((self.num_tickers, self.window_max - (window - 1)))
+            din[:, 0] = np.nansum(neg[:, 1: window + 1], axis=1)
+            for i in range(1, din.shape[1] - 1):
+                din[:, i] = din[:, i - 1] - (din[:, i - 1] / float(window)) + neg[:, window + i]
+
+            zeros_trs = np.zeros((self.num_tickers, trs.shape[1]))
+            dip_new = zeros_trs.copy()
+            dip_new[:, :trs.shape[1]] = 100 * dip[:, :trs.shape[1]] / (trs + 1e-10)
+
+            din_new = zeros_trs.copy()
+            din_new[:, :trs.shape[1]] = 100 * din[:, :trs.shape[1]] / (trs + 1e-10)
+
+            directional_index = 100 * np.abs((dip_new - din_new) / (dip_new + din_new + 1e-10))
+
+            adx_series = zeros_trs.copy()
+            adx_series[:, window] = np.mean(directional_index[:, :window], axis=1)
+            for i in range(window + 1, adx_series.shape[1]):
+                adx_series[:, i] = ((adx_series[:, i - 1] * (window - 1)) + directional_index[:, i - 1]) / float(window)
+
+            trend_adx = np.concatenate((trs_initial, adx_series), axis=1)
+
+            trend_adx_pos = np.zeros((self.num_tickers, self.window_max))
+            for i in range(1, trs.shape[1] - 1):
+                trend_adx_pos[:, i + window] = 100 * (dip[:, i] / trs[:, i])
+
+            trend_adx_neg = np.zeros((self.num_tickers, self.window_max))
+            for i in range(1, trs.shape[1] - 1):
+                trend_adx_neg[:, i + window] = 100 * (din[:, i] / trs[:, i])
+        else:
+            trend_adx = np.full((self.num_tickers, self.window_max), np.nan)
+            trend_adx_pos = np.full((self.num_tickers, self.window_max), np.nan)
+            trend_adx_neg = np.full((self.num_tickers, self.window_max), np.nan)
+        result[:, :, 21] = trend_adx
+        result[:, :, 22] = trend_adx_pos
+        result[:, :, 23] = trend_adx_neg
+
+        # CCI Indicator
+        window_default = 20
+        cci_constant = 0.015
+        window = self.resized_window(window_default)
+        cci_numerator = self.typical_price - self.np_rolling_mean(self.typical_price, window)
+        typical_price_window = self.rolling_window(self.typical_price, window)
+        mad = np.zeros((self.num_tickers, self.window_max))
+        mad[:, window - 1:] = np.mean(
+            np.abs(typical_price_window - np.mean(typical_price_window, axis=-1, keepdims=True)), axis=-1)
+        cci_denominator = cci_constant * mad
+        trend_cci = cci_numerator / (cci_denominator + 1e-10)
+        result[:, :, 24] = trend_cci
+
+        # # Ichimoku Visual Indicator
+        window_2_default = 26
+        window_2 = self.resized_window(window_2_default)
+        window_3_default = 52
+        window_3 = self.resized_window(window_3_default)
+        trend_visual_ichimoku_a = trend_ichimoku_a.copy()
+        trend_visual_ichimoku_a = np.roll(trend_visual_ichimoku_a, window_2, axis=1)
+        trend_visual_ichimoku_a[:, :window_2] = np.nanmean(trend_visual_ichimoku_a, axis=1)[:, None]
+        trend_visual_ichimoku_b = trend_ichimoku_b.copy()
+        trend_visual_ichimoku_b = np.roll(trend_visual_ichimoku_b, window_2,
+                                          axis=1)  # yes, the original had window_2 ...
+        trend_visual_ichimoku_b[:, :window_2] = np.nanmean(trend_ichimoku_b, axis=1)[:,
+                                                None]  # yes the original had window_2...
+        result[:, :, 25] = trend_visual_ichimoku_a
+        result[:, :, 26] = trend_visual_ichimoku_b
+
+        # # Aroon Indicator
+        window_default = 25
+        window = self.resized_window(window_default)
+        rolling_close = self.rolling_window(self._close, window)
+        trend_aroon_up = np.zeros((self.num_tickers, self.window_max))
+        trend_aroon_up[:, window - 1:] = (np.argmax(rolling_close, axis=-1) + 1) / window * 100
+        trend_aroon_down = np.zeros((self.num_tickers, self.window_max))
+        trend_aroon_down[:, window - 1:] = (np.argmin(rolling_close, axis=-1) + 1) / window * 100
+        trend_aroon_ind = trend_aroon_up - trend_aroon_down
+        result[:, :, 27] = trend_aroon_up
+        result[:, :, 28] = trend_aroon_down
+        result[:, :, 29] = trend_aroon_ind
+
+        # # PSAR Indicator
+        up_trend = np.ones(self.num_tickers, dtype=bool)
+        step = 0.02
+        max_step = 0.20
+        up_trend_high = self._high[:, 0].copy()
+        down_trend_low = self._low[:, 0].copy()
+
+        psar = self._close.copy()
+        psar_up = np.full_like(psar, np.nan)
+        psar_down = np.full_like(psar, np.nan)
+        acceleration_factor = np.full(self.num_tickers, step)
+
+        for i in range(2, self.window_max):
+            reversal = np.zeros(self.num_tickers, dtype=bool)
+
+            max_high = self._high[:, i]
+            min_low = self._low[:, i]
+
+            psar[:, i] = np.where(up_trend, psar[:, i - 1] + (acceleration_factor * (up_trend_high - psar[:, i - 1])),
+                                  psar[:, i - 1] - (acceleration_factor * (psar[:, i - 1] - down_trend_low)))
+
+            condition_A = up_trend & (min_low < psar[:, i])
+            condition_B = up_trend & (min_low >= psar[:, i])
+            condition_B_extra = condition_B & (max_high > up_trend_high)
+            condition_C = ~up_trend & (max_high > psar[:, i])
+            condition_D = ~up_trend & (max_high <= psar[:, i])
+            condition_D_extra = condition_D & (min_low < down_trend_low)
+
+            reversal[condition_A] = True
+            psar[condition_A, i] = up_trend_high[condition_A]
+            down_trend_low[condition_A] = min_low[condition_A]
+            acceleration_factor[condition_A] = step
+
+            up_trend_high[condition_B_extra] = max_high[condition_B_extra]
+            acceleration_factor[condition_B_extra] = np.minimum(acceleration_factor[condition_B_extra] + step, max_step)
+
+            low1 = self._low[:, i - 1]
+            low2 = self._low[:, i - 2]
+            condition_low_2 = condition_B & (low2 < psar[:, i])
+            condition_low_1 = condition_B & ~(low2 < psar[:, i]) & (low1 < psar[:, i])
+
+            psar[condition_low_2, i] = low2[condition_low_2]
+            psar[condition_low_1, i] = low1[condition_low_1]
+
+            reversal[condition_C] = True
+            psar[condition_C, i] = down_trend_low[condition_C]
+            up_trend_high[condition_C] = max_high[condition_C]
+            acceleration_factor[condition_C] = step
+
+            down_trend_low[condition_D_extra] = min_low[condition_D_extra]
+            acceleration_factor[condition_D_extra] = np.minimum(acceleration_factor[condition_D_extra] + step, max_step)
+
+            high1 = self._high[:, i - 1]
+            high2 = self._high[:, i - 2]
+            condition_high_2 = condition_D & (high2 > psar[:, i])
+            condition_high_1 = condition_D & ~(high2 > psar[:, i]) & (high1 > psar[:, i])
+            psar[condition_high_2, i] = high2[condition_high_2]
+            psar[condition_high_1, i] = high1[condition_high_1]
+
+            up_trend = np.where(reversal, ~up_trend, up_trend)
+
+            psar_up[np.where(up_trend), i] = psar[np.where(up_trend), i]
+            psar_down[np.where(~up_trend), i] = psar[np.where(~up_trend), i]
+            # print(sum(acceleration_factor))
+
+        trend_psar_up = psar_up
+        trend_psar_down = psar_down
+        trend_psar_up_indicator = np.where(
+            np.logical_and(~np.isnan(psar_up), np.isnan(np.roll(psar_up, 1, axis=1))), 0, psar_up)
+        trend_psar_up_indicator = np.where(trend_psar_up_indicator == 0, 1, 0)
+        trend_psar_down_indicator = np.where(
+            np.logical_and(~np.isnan(psar_down), np.isnan(np.roll(psar_down, 1, axis=1))), 0, psar_up)
+        trend_psar_down_indicator = np.where(trend_psar_down_indicator == 0, 1, 0)
+        result[:, :, 30] = trend_psar_up
+        result[:, :, 31] = trend_psar_down
+        result[:, :, 32] = trend_psar_up_indicator
+        result[:, :, 33] = trend_psar_down_indicator
+
+        return result
+
+    def add_momentum_ta(self):
+
+        result = np.empty((self.num_tickers, self.window_max, 18))
+
+        # # Relative Strength Index (RSI)
+        window_default = 14
+        window = self.resized_window(window_default)
+        up_direction = np.where(self.shifted_c_diff > 0, self.shifted_c_diff, 0.0)
+        down_direction = np.where(self.shifted_c_diff < 0, - self.shifted_c_diff, 0.0)
+        emaup = self.np_ema(up_direction, window, 1 / window)
+        emadn = self.np_ema(down_direction, window, 1 / window)
+        relative_strength = emaup / (emadn + 1e-10)
+        rsi = np.where(emadn == 0, 100, 100 - (100 / (1 + relative_strength)))
+        result[:, :, 0] = rsi
+
+        # # Stoch RSI (StochRSI)
+        smooth1_default = 3
+        smooth2_default = 3
+        if self.window_max > 3:
+            smooth1 = self.resized_window(smooth1_default)
+            smooth2 = self.resized_window(smooth2_default)
+            lowest_low_rsi = self.np_rolling_min(rsi, window)
+            max_rsi = self.np_rolling_max(rsi, window)
+            momentum_stoch_rsi = (rsi - lowest_low_rsi) / (max_rsi - lowest_low_rsi + 1e-10)
+            momentum_stoch_rsi_k = self.np_rolling_mean(momentum_stoch_rsi, smooth1)
+            momentum_stoch_rsi_d = self.np_rolling_mean(momentum_stoch_rsi_k, smooth2)
+        else:
+            momentum_stoch_rsi = np.full((self.num_tickers, self.window_max), np.nan)
+            momentum_stoch_rsi_k = np.full((self.num_tickers, self.window_max), np.nan)
+            momentum_stoch_rsi_d = np.full((self.num_tickers, self.window_max), np.nan)
+        result[:, :, 1] = momentum_stoch_rsi
+        result[:, :, 2] = momentum_stoch_rsi_k
+        result[:, :, 3] = momentum_stoch_rsi_d
+
+        # # TSI Indicator
+        window_slow_default = 25
+        window_slow = self.resized_window(window_slow_default)
+        window_fast_default = 13
+        window_fast = self.resized_window(window_fast_default)
+        smoothed_pt1 = self.np_ema(self.shifted_c_diff, window_slow)
+        smoothed = self.np_ema(smoothed_pt1, window_fast)
+        smoothed_abs_pt1 = self.np_ema(np.abs(self.shifted_c_diff), window_slow)
+        smoothed_abs = self.np_ema(smoothed_abs_pt1, window_fast)
+        momentum_tsi = smoothed / smoothed_abs * 100
+        result[:, :, 4] = momentum_tsi
+
+        # # Ultimate Oscillator
+        window_1_default = 7
+        window_1 = self.resized_window(window_1_default)
+        window_2_default = 14
+        window_2 = self.resized_window(window_2_default)
+        window_3_default = 28
+        window_3 = self.resized_window(window_3_default)
+        weight1 = 4.0
+        weight2 = 2.0
+        weight3 = 1.0
+        buying_pressure = self._close - np.minimum(self._low, self.shift_c_fillna)
+        avg_s = (self.np_rolling_sum(buying_pressure, window_1) / self.np_rolling_sum(self.true_range, window_1))
+        avg_m = (self.np_rolling_sum(buying_pressure, window_2) / self.np_rolling_sum(self.true_range, window_2))
+        avg_l = (self.np_rolling_sum(buying_pressure, window_3) / self.np_rolling_sum(self.true_range, window_3))
+        momentum_uo = (
+                    100.0 * ((weight1 * avg_s) + (weight2 * avg_m) + (weight3 * avg_l)) / (weight1 + weight2 + weight3))
+        result[:, :, 5] = momentum_uo
+
+        # # Stoch Indicator
+        window_default = 14
+        window = self.resized_window(window_default)
+        smooth_window_default = 3
+        smooth_window = self.resized_window(smooth_window_default)
+        if window == 14:
+            smin = self.lowest_low_14
+            delta_max_min = self.delta_hhigh_llow_14
+        else:
+            smin = self.np_rolling_min(self._low, window)
+            smax = self.np_rolling_max(self._high, window)
+            delta_max_min = smax - smin
+
+        momentum_stoch = 100 * (self._close - smin) / (delta_max_min + 1e-10)
+        momentum_stoch_signal = self.np_rolling_mean(momentum_stoch, smooth_window)
+        result[:, :, 6] = momentum_stoch
+        result[:, :, 7] = momentum_stoch_signal
+
+        # Williams R Indicator
+        lbp_default = 14
+        lbperiod = self.resized_window(lbp_default)
+        if lbp_default == 14:
+            highest_high = self.highest_high_14
+            momentum_wr = 100 * (self._close - highest_high) / (self.delta_hhigh_llow_14 + 1e-10)
+        else:
+            lowest_low = self.np_rolling_min(self._low, lbperiod)
+            highest_high = self.np_rolling_max(self._low, lbperiod)
+            momentum_wr = -100 * (highest_high - self._close) / (highest_high - lowest_low)
+        result[:, :, 8] = momentum_wr
+
+        # # Awesome Oscillator
+        window_1_default = 5
+        window_1 = self.resized_window(window_1_default)
+        window_2_default = 34
+        window_2 = self.resized_window(window_2_default)
+        median_price = 0.5 * (self._high + self._low)
+        momentum_ao = self.np_rolling_mean(median_price, window_1) - self.np_rolling_mean(median_price, window_2)
+        result[:, :, 9] = momentum_ao
+
+        # # Rate Of Change
+        window_default = 12
+        window = self.resized_window(window_default)
+        closed_shifted_by_window = self.np_shift_fast_window(self._close, window)
+        momentum_roc = 100 * (self._close - closed_shifted_by_window) / closed_shifted_by_window
+        result[:, :, 10] = momentum_roc
+
+        # # Percentage Price Oscillator
+        window_sign_default = 9
+        window_sign = self.resized_window(window_sign_default)
+        momentum_ppo = ((self.emafast - self.emaslow) / self.emaslow) * 100
+        momentum_ppo_signal = self.np_ema(momentum_ppo, window_sign)
+        momentum_ppo_hist = momentum_ppo - momentum_ppo_signal
+        result[:, :, 11] = momentum_ppo
+        result[:, :, 12] = momentum_ppo_signal
+        result[:, :, 13] = momentum_ppo_hist
+
+        # # Percentage Volume Oscillator
+        window_slow_default = 26
+        window_slow = self.resized_window(window_slow_default)
+        window_fast_default = 12
+        window_fast = self.resized_window(window_fast_default)
+        window_sign_default = 9
+        window_sign = self.resized_window(window_sign_default)
+        v_emafast = self.np_ema(self._volume, window_fast)
+        v_emaslow = self.np_ema(self._volume, window_slow)
+        momentum_pvo = ((v_emafast - v_emaslow) / v_emaslow) * 100
+        momentum_pvo_signal = self.np_ema(momentum_pvo, window_sign)
+        momentum_pvo_hist = momentum_pvo - momentum_pvo_signal
+        result[:, :, 14] = momentum_pvo
+        result[:, :, 15] = momentum_pvo_signal
+        result[:, :, 16] = momentum_pvo_hist
+
+        # # KAMA
+        window_default = 10
+        window = self.resized_window(window_default)
+        pow1 = 2
+        pow2 = 30
+        window = self.resized_window(window)
+        vola = abs(self._close - np.roll(self._close, 1, axis=1))
+        er_num = abs(self._close - np.roll(self._close, window, axis=1))
+        er_den = self.np_rolling_sum(vola, window)
+        efficiency_ratio = np.divide(er_num, er_den, out=np.zeros_like(er_num), where=er_den != 0)
+        smoothing_constant = ((efficiency_ratio * (2.0 / (pow1 + 1) - 2.0 / (pow2 + 1.0)) + 2 / (pow2 + 1.0)) ** 2.0)
+
+        kama = np.zeros(smoothing_constant.shape)
+        len_kama = kama.shape[1]
+        first_value = np.isnan(smoothing_constant[:, 0])
+        kama[first_value, 0] = np.nan
+        kama[~first_value, 0] = self._close[~first_value, 0]
+        for i in range(1, len_kama):
+            first_value = np.isnan(smoothing_constant[:, i])
+            kama[first_value, i] = np.nan
+            kama[~first_value, i] = np.where(np.isnan(kama[~first_value, i - 1]), self._close[~first_value, i],
+                                             kama[~first_value, i - 1] + smoothing_constant[~first_value, i] * (
+                                                     self._close[~first_value, i] - kama[~first_value, i - 1]))
+        result[:, :, 17] = kama
+
+        return result
+
+    def add_others_ta(self):
+        result = np.empty((self.num_tickers, self.window_max, 3))
+
+        # # Daily Return
+        others_dr = (self._close / self.shift_c_fill_mean - 1) * 100
+        result[:, :, 0] = others_dr
+
+        # # Daily Log Return
+        log_close = np.log(self._close)
+        others_dlr = self.np_shift_diff_fast(log_close) * 100
+        result[:, :, 1] = others_dlr
+
+        # # Cumulative Return
+        others_cr = (self._close / self._close[:, 0, None] - 1) * 100
+        result[:, :, 2] = others_cr
+
+        return result
